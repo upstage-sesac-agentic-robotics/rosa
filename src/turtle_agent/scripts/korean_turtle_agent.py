@@ -156,7 +156,7 @@ QUERY_HINTS = [
     (["b-point", "b포인트", "B지점", "b지점"], "move_to_b_point()를 호출해라"),
     (["c-point", "c포인트", "C지점", "c지점"], "move_to_c_point()를 호출해라"),
     # get_turtle_pose
-    (["위치", "어디", "포즈", "���표"], "get_turtle_pose를 호출해라"),
+    (["위치", "어디", "포즈", "좌표"], "get_turtle_pose를 호출해라"),
     # set_pen
     (["빨간", "빨강"], "set_pen(name='turtle1', r=255, g=0, b=0, width=2, off=0)을 호출해라"),
     (["파란", "파랑"], "set_pen(name='turtle1', r=0, g=0, b=255, width=2, off=0)을 호출해라"),
