@@ -171,18 +171,35 @@ class TestTools(unittest.TestCase):
     """TOOLS 등록 목록 검증."""
 
     def test_tool_count(self):
-        self.assertEqual(len(TOOLS), 7)
+        self.assertEqual(len(TOOLS), 24)
 
     def test_expected_tool_names(self):
         names = {t.name for t in TOOLS}
         expected = {
             "get_turtle_pose",
+            "teleport_absolute",
+            "teleport_relative",
+            "publish_twist_to_cmd_vel",
             "move_to_a_point",
             "move_to_b_point",
             "move_to_c_point",
             "set_pen",
+            "spawn_turtle",
+            "kill_turtle",
+            "stop_turtle",
             "list_obstacles",
+            "add_obstacle",
+            "remove_obstacle",
             "reset_turtlesim",
+            "clear_turtlesim",
+            "has_moved_to_expected_coordinates",
+            "draw_line_segment",
+            "draw_rectangle",
+            "draw_polyline",
+            "calculate_rectangle_bounds",
+            "check_rectangles_overlap",
+            "draw_circle",
+            "draw_arc",
         }
         self.assertEqual(names, expected)
 
@@ -191,10 +208,11 @@ class TestTools(unittest.TestCase):
         names = {t.name for t in TOOLS}
         self.assertNotIn("move_to_point", names)
 
-    def test_no_teleport_in_tools(self):
-        """teleport_absolute가 도구 목록에 없는지 확인."""
+    def test_teleport_is_restored_in_tools(self):
+        """teleport 도구가 도구 목록에 복원되었는지 확인."""
         names = {t.name for t in TOOLS}
-        self.assertNotIn("teleport_absolute", names)
+        self.assertIn("teleport_absolute", names)
+        self.assertIn("teleport_relative", names)
 
     def test_no_avoidance_tools(self):
         """회피 도구가 제거되었는지 확인."""

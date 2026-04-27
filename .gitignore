@@ -10,3 +10,4 @@ __pycache__/
 logs/
 .specstory
 issue_parallel_turtle_motions.md
+.venv/

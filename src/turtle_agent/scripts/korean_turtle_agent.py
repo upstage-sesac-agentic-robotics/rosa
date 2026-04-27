@@ -58,11 +58,26 @@ from langchain.agents import tool as langchain_tool
 from tools.turtle import (
     get_turtle_pose,
     teleport_absolute,
+    teleport_relative,
     publish_twist_to_cmd_vel,
     set_pen,
+    spawn_turtle,
+    kill_turtle,
+    stop_turtle,
     reset_turtlesim,
+    clear_turtlesim,
+    has_moved_to_expected_coordinates,
+    draw_line_segment,
+    draw_rectangle,
+    draw_polyline,
+    calculate_rectangle_bounds,
+    check_rectangles_overlap,
+    draw_circle,
+    draw_arc,
 )
 from tools.obstacle import (
+    add_obstacle,
+    remove_obstacle,
     list_obstacles,
 )
 
@@ -114,12 +129,29 @@ def move_to_c_point() -> str:
 
 TOOLS = [
     get_turtle_pose,
+    teleport_absolute,
+    teleport_relative,
+    publish_twist_to_cmd_vel,
     move_to_a_point,
     move_to_b_point,
     move_to_c_point,
     set_pen,
+    spawn_turtle,
+    kill_turtle,
+    stop_turtle,
     list_obstacles,
+    add_obstacle,
+    remove_obstacle,
     reset_turtlesim,
+    clear_turtlesim,
+    has_moved_to_expected_coordinates,
+    draw_line_segment,
+    draw_rectangle,
+    draw_polyline,
+    calculate_rectangle_bounds,
+    check_rectangles_overlap,
+    draw_circle,
+    draw_arc,
 ]
 
 SYSTEM_PROMPT = (
@@ -127,14 +159,21 @@ SYSTEM_PROMPT = (
     "\n"
     "환경: 11x11 2D 공간.\n"
     "\n"
-    "사용 가능한 도구 7개:\n"
+    "사용 가능한 도구:\n"
     "- get_turtle_pose: 거북이 현재 위치 확인\n"
+    "- teleport_absolute/teleport_relative: 순간이동\n"
+    "- publish_twist_to_cmd_vel/stop_turtle: 이동 및 정지\n"
     "- move_to_a_point(): a-point (1,5)로 직선 이동\n"
     "- move_to_b_point(): b-point (10,5)로 직선 이동\n"
     "- move_to_c_point(): c-point (6,7)로 직선 이동\n"
     "- set_pen(name, r, g, b, width, off): 펜 색상/켜기(off=0)/끄기(off=1)\n"
-    "- list_obstacles: 현재 장애물 목록 조회\n"
-    "- reset_turtlesim: 환경 초기화\n"
+    "- spawn_turtle/kill_turtle: 거북이 생성/삭제\n"
+    "- list_obstacles/add_obstacle/remove_obstacle: 장애물 조회/추가/삭제\n"
+    "- reset_turtlesim/clear_turtlesim: 환경 초기화/화면 지우기\n"
+    "- has_moved_to_expected_coordinates: 목표 좌표 도달 확인\n"
+    "- draw_line_segment/draw_rectangle/draw_polyline: 직선/사각형/폴리라인 그리기\n"
+    "- draw_circle/draw_arc: 원/호 그리기\n"
+    "- calculate_rectangle_bounds/check_rectangles_overlap: 사각형 계산/겹침 검사\n"
     "\n"
     "이동 규칙:\n"
     "- a-point로 이동 → move_to_a_point()\n"
