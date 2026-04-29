@@ -7,7 +7,10 @@ import sys
 import threading
 import time
 import unittest
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS = _REPO_ROOT / "src" / "turtle_agent" / "scripts"
@@ -18,6 +21,18 @@ from turtle_control_agent import (  # noqa: E402
     TurtleControlAgent,
     TurtleTask,
 )
+from turtle_control_decision import (  # noqa: E402
+    ActionValidator,
+    DecisionAction,
+)
+from turtle_control_prompt_log import ControlAgentPromptLog  # noqa: E402
+from turtle_control_scheduler import (  # noqa: E402
+    PriorityTaskQueue,
+    STATUS_FAILED,
+    STATUS_QUEUED,
+    ScheduledTurtleTask,
+)
+from turtle_control_state import WorldState  # noqa: E402
 from turtle_control_prompts import WORKER_SYSTEM_PROMPT  # noqa: E402
 
 
@@ -55,12 +70,32 @@ class FakeLlmPlanner:
         return self.prompts
 
 
+class SequenceDecisionPlanner:
+    def __init__(self, responses):
+        self.responses = deque(responses)
+        self.prompts = []
+
+    def invoke(self, prompt):
+        self.prompts.append(prompt)
+        if self.responses:
+            return self.responses.popleft()
+        return {"actions": [{"type": "finish", "reason": "done"}]}
+
+
+@dataclass(frozen=True)
+class FakePose:
+    x: float
+    y: float
+    theta: float = 0.0
+
+
 class TestTurtleControlAgent(unittest.TestCase):
     def test_default_worker_system_prompt_matches_task_policy(self):
         self.assertEqual(DEFAULT_WORKER_SYSTEM_PROMPT, WORKER_SYSTEM_PROMPT)
         self.assertIn("worker agent", DEFAULT_WORKER_SYSTEM_PROMPT)
         self.assertIn("전달받은 task 하나만 수행", DEFAULT_WORKER_SYSTEM_PROMPT)
-        self.assertIn("결과만 간결하게 답하세요", DEFAULT_WORKER_SYSTEM_PROMPT)
+        self.assertIn("각 tool의 스키마에 맞춰 필요한 인자를 직접 결정", DEFAULT_WORKER_SYSTEM_PROMPT)
+        self.assertIn("마지막 응답은 반드시 다음 상태 중 하나로 시작", DEFAULT_WORKER_SYSTEM_PROMPT)
 
     def test_runs_workers_in_parallel(self):
         barrier = threading.Barrier(2)
@@ -284,7 +319,7 @@ class TestTurtleControlAgent(unittest.TestCase):
         results = control.run_user_prompt("삼각형을 선분으로 나누어 그리시오", planner)
 
         self.assertEqual(len(planner.calls), 1)
-        self.assertIn("여러 worker agent를 조율하는 컨트롤 에이전트", planner.calls[0])
+        self.assertIn("여러 turtle worker agent를 조율하는 컨트롤 에이전트", planner.calls[0])
         self.assertIn("사용자 요청:\n삼각형을 선분으로 나누어 그리시오", planner.calls[0])
         self.assertEqual(len(results), 3)
         self.assertTrue(all(result.ok for result in results))
@@ -309,6 +344,392 @@ class TestTurtleControlAgent(unittest.TestCase):
         self.assertFalse(results[0].ok)
         self.assertEqual(results[0].turtle_id, "control")
         self.assertIn("planner failed: RuntimeError: llm unavailable", results[0].error)
+
+    def test_autonomous_goal_generates_dependent_prompt_after_worker_completion(self):
+        log = []
+        lock = threading.Lock()
+        control = TurtleControlAgent(
+            {
+                "turtle1": _make_recording_worker(log, lock),
+                "turtle2": _make_recording_worker(log, lock),
+            }
+        )
+        planner = SequenceDecisionPlanner(
+            [
+                {
+                    "actions": [
+                        {
+                            "type": "enqueue",
+                            "task_id": "task-1",
+                            "assigned_worker": "turtle1",
+                            "instruction": "첫 번째 구간을 완성하시오",
+                            "priority": 10,
+                        }
+                    ]
+                },
+                {
+                    "actions": [
+                        {
+                            "type": "enqueue",
+                            "task_id": "task-2",
+                            "assigned_worker": "turtle2",
+                            "instruction": "task-1 결과를 바탕으로 두 번째 구간을 완성하시오",
+                            "priority": 10,
+                            "depends_on": ["task-1"],
+                        }
+                    ]
+                },
+                {"actions": [{"type": "finish", "reason": "goal done"}]},
+            ]
+        )
+
+        results = control.run_autonomous_goal("순차 의존 작업을 수행하시오", planner)
+
+        self.assertTrue(all(result.ok for result in results))
+        self.assertEqual([entry[0] for entry in log], ["turtle1", "turtle2"])
+        self.assertIn("첫 번째 구간을 완성하시오", log[0][1])
+        self.assertIn("task-1 결과를 바탕으로 두 번째 구간을 완성하시오", log[1][1])
+
+    def test_autonomous_goal_does_not_release_dependency_when_verification_fails(self):
+        log = []
+        lock = threading.Lock()
+        state = WorldState()
+        state.on_pose("turtle1", FakePose(0.0, 0.0), stamp=1.0)
+        control = TurtleControlAgent(
+            {
+                "turtle1": _make_recording_worker(log, lock),
+                "turtle2": _make_recording_worker(log, lock),
+            }
+        )
+        planner = SequenceDecisionPlanner(
+            [
+                {
+                    "actions": [
+                        {
+                            "type": "enqueue",
+                            "task_id": "task-1",
+                            "assigned_worker": "turtle1",
+                            "instruction": "목표 위치로 이동하시오",
+                            "completion_hint": {
+                                "expected_turtle": "turtle1",
+                                "expected_region": {
+                                    "min_x": 5,
+                                    "max_x": 6,
+                                    "min_y": 5,
+                                    "max_y": 6,
+                                },
+                            },
+                        }
+                    ]
+                },
+                {
+                    "actions": [
+                        {
+                            "type": "enqueue",
+                            "task_id": "task-2",
+                            "assigned_worker": "turtle2",
+                            "instruction": "후속 목표를 수행하시오",
+                            "depends_on": ["task-1"],
+                        }
+                    ]
+                },
+                {"actions": [{"type": "wait", "reason": "dependency pending"}]},
+                {"actions": [{"type": "wait", "reason": "dependency pending"}]},
+            ]
+        )
+
+        results = control.run_autonomous_goal(
+            "검증 후 후속 작업을 수행하시오",
+            planner,
+            world_state=state,
+            max_wait_iterations=2,
+        )
+
+        self.assertEqual([entry[0] for entry in log], ["turtle1"])
+        tasks = {task.task_id: task for task in state.snapshot().tasks}
+        self.assertEqual(tasks["task-1"].status, STATUS_FAILED)
+        self.assertEqual(tasks["task-2"].status, STATUS_QUEUED)
+        self.assertFalse(results[-1].ok)
+        self.assertIn("blocked", results[-1].error)
+
+    def test_autonomous_goal_runs_highest_priority_ready_task_first(self):
+        log = []
+        lock = threading.Lock()
+        control = TurtleControlAgent({"turtle1": _make_recording_worker(log, lock)})
+        planner = SequenceDecisionPlanner(
+            [
+                {
+                    "actions": [
+                        {
+                            "type": "enqueue",
+                            "task_id": "low",
+                            "assigned_worker": "turtle1",
+                            "instruction": "낮은 우선순위 작업",
+                            "priority": 1,
+                        },
+                        {
+                            "type": "enqueue",
+                            "task_id": "high",
+                            "assigned_worker": "turtle1",
+                            "instruction": "높은 우선순위 작업",
+                            "priority": 10,
+                        },
+                    ]
+                },
+                {"actions": [{"type": "finish", "reason": "stop after first"}]},
+            ]
+        )
+
+        control.run_autonomous_goal("우선순위를 검증하시오", planner)
+
+        self.assertIn("높은 우선순위 작업", log[0][1])
+
+    def test_autonomous_goal_can_cancel_queued_task(self):
+        log = []
+        lock = threading.Lock()
+        control = TurtleControlAgent({"turtle1": _make_recording_worker(log, lock)})
+        planner = SequenceDecisionPlanner(
+            [
+                {
+                    "actions": [
+                        {
+                            "type": "enqueue",
+                            "task_id": "task-1",
+                            "assigned_worker": "turtle1",
+                            "instruction": "취소될 작업",
+                        },
+                        {
+                            "type": "enqueue",
+                            "task_id": "task-2",
+                            "assigned_worker": "turtle1",
+                            "instruction": "실행될 작업",
+                            "priority": 5,
+                        },
+                        {
+                            "type": "cancel_queued",
+                            "task_id": "task-1",
+                            "reason": "not needed",
+                        },
+                    ]
+                },
+                {"actions": [{"type": "finish", "reason": "done"}]},
+            ]
+        )
+
+        control.run_autonomous_goal("큐 삭제를 검증하시오", planner)
+
+        self.assertEqual(len(log), 1)
+        self.assertIn("실행될 작업", log[0][1])
+
+    def test_autonomous_goal_does_not_reuse_failed_worker(self):
+        log = []
+        lock = threading.Lock()
+
+        def failing_worker(task):
+            with lock:
+                log.append((task.turtle_id, task.instruction))
+            raise RuntimeError("planned failure")
+
+        def ok_worker(task):
+            with lock:
+                log.append((task.turtle_id, task.instruction))
+            return f"ok:{task.instruction}"
+
+        control = TurtleControlAgent(
+            {
+                "turtle1": failing_worker,
+                "turtle2": ok_worker,
+            }
+        )
+        planner = SequenceDecisionPlanner(
+            [
+                {
+                    "actions": [
+                        {
+                            "type": "enqueue",
+                            "task_id": "task-1",
+                            "assigned_worker": "turtle1",
+                            "instruction": "실패할 작업",
+                        }
+                    ]
+                },
+                {
+                    "actions": [
+                        {
+                            "type": "enqueue",
+                            "task_id": "task-2",
+                            "assigned_worker": "",
+                            "instruction": "남은 worker가 수행할 작업",
+                        }
+                    ]
+                },
+                {"actions": [{"type": "finish", "reason": "done"}]},
+            ]
+        )
+
+        results = control.run_autonomous_goal("실패 worker 격리를 검증하시오", planner)
+
+        self.assertEqual([entry[0] for entry in log], ["turtle1", "turtle2"])
+        self.assertIn("실패할 작업", log[0][1])
+        self.assertIn("남은 worker가 수행할 작업", log[1][1])
+        self.assertFalse(results[0].ok)
+        self.assertTrue(results[1].ok)
+
+    def test_priority_queue_rejects_running_task_cancel(self):
+        queue = PriorityTaskQueue()
+        queue.add(
+            ScheduledTurtleTask(
+                task_id="task-1",
+                assigned_worker="turtle1",
+                instruction="running task",
+            )
+        )
+        queue.mark_running("task-1")
+
+        with self.assertRaises(ValueError):
+            queue.cancel("task-1")
+
+    def test_autonomous_goal_writes_control_prompt_simulation_table_when_requested(self):
+        lock = threading.Lock()
+        control = TurtleControlAgent({"turtle1": _make_recording_worker([], lock)})
+        planner = SequenceDecisionPlanner(
+            [
+                {
+                    "actions": [
+                        {
+                            "type": "enqueue",
+                            "task_id": "task-1",
+                            "assigned_worker": "turtle1",
+                            "instruction": "assigned_turtle로 기준선을 완성하시오",
+                        }
+                    ]
+                },
+                {"actions": [{"type": "finish", "reason": "goal done"}]},
+            ]
+        )
+        with TemporaryDirectory() as temp_dir:
+            log_path = (
+                Path(temp_dir)
+                / "logs"
+                / "2026-04-28"
+                / "session-1"
+                / "ControlAgentPrompt.md"
+            )
+
+            results = control.run_autonomous_goal(
+                "기준선을 그리고 완료를 보고하시오",
+                planner,
+                control_prompt_log_path=log_path,
+            )
+
+            self.assertTrue(all(result.ok for result in results))
+            content = log_path.read_text(encoding="utf-8")
+            self.assertIn("### 시뮬레이션 표", content)
+            self.assertIn(
+                "| 시각 | 컨트롤 판단/이벤트 | 생성된 worker 프롬프트 | 담당 워커 | 실행 상태 | 예상 실행 시간 |",
+                content,
+            )
+            self.assertIn("assigned_turtle로 기준선을 완성하시오", content)
+            self.assertIn("CompletionVerifier", content)
+
+    def test_control_prompt_log_replaces_invalid_unicode_without_crashing(self):
+        with TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "ControlAgentPrompt.md"
+            process_log = ControlAgentPromptLog(log_path)
+
+            process_log.begin("bad surrogate \udcff prompt", ("turtle1",))
+            process_log.row("event with bad surrogate \udcff")
+            process_log.flush()
+
+            content = log_path.read_text(encoding="utf-8")
+            self.assertIn("bad surrogate", content)
+            self.assertIn("event with bad surrogate", content)
+
+    def test_autonomous_goal_accepts_instruction_aliases_from_llm_json(self):
+        log = []
+        lock = threading.Lock()
+        control = TurtleControlAgent({"turtle1": _make_recording_worker(log, lock)})
+        planner = SequenceDecisionPlanner(
+            [
+                """```json
+{
+  "actions": [
+    {
+      "type": "enqueue",
+      "task_id": "task-1",
+      "worker": "turtle1",
+      "worker_prompt": "assigned_turtle로 첫 번째 변을 완성하고 상태를 보고하시오"
+    }
+  ]
+}
+```""",
+                {"actions": [{"type": "finish", "reason": "goal done"}]},
+            ]
+        )
+
+        results = control.run_autonomous_goal("삼각형을 그리시오", planner)
+
+        self.assertTrue(all(result.ok for result in results))
+        self.assertIn("assigned_turtle로 첫 번째 변을 완성하고 상태를 보고하시오", log[0][1])
+        self.assertIn("enqueue action 필수 형식", planner.prompts[0])
+        self.assertIn("WorkerTask 작성 규칙", planner.prompts[0])
+
+    def test_autonomous_goal_sends_worker_task_schema_to_worker(self):
+        log = []
+        lock = threading.Lock()
+        control = TurtleControlAgent({"turtle1": _make_recording_worker(log, lock)})
+        planner = SequenceDecisionPlanner(
+            [
+                {
+                    "actions": [
+                        {
+                            "type": "enqueue",
+                            "task_id": "task-1",
+                            "assigned_worker": "turtle1",
+                            "worker_task": {
+                                "task_id": "task-1",
+                                "assigned_turtle": "turtle1",
+                                "goal": "첫 번째 변을 관찰 가능한 이동으로 그리기",
+                                "constraints": {
+                                    "no_position_teleport": True,
+                                    "allow_in_place_rotation": True,
+                                },
+                                "completion_criteria": {
+                                    "status_must_be": "done",
+                                    "no_collision_required": True,
+                                },
+                                "context": {"user_intent": "삼각형 그리기"},
+                            },
+                        }
+                    ]
+                },
+                {"actions": [{"type": "finish", "reason": "goal done"}]},
+            ]
+        )
+
+        results = control.run_autonomous_goal("삼각형을 그리시오", planner)
+
+        self.assertTrue(all(result.ok for result in results))
+        self.assertIn('"goal": "첫 번째 변을 관찰 가능한 이동으로 그리기"', log[0][1])
+        self.assertIn('"no_position_teleport": true', log[0][1])
+        self.assertIn('"assigned_turtle": "turtle1"', log[0][1])
+
+    def test_action_validator_rejects_tool_level_subprompt(self):
+        result = ActionValidator().validate(
+            [
+                DecisionAction(
+                    type="enqueue",
+                    task_id="task-1",
+                    assigned_worker="turtle1",
+                    instruction="publish_twist_to_cmd_vel을 velocity=1로 호출하시오",
+                )
+            ],
+            worker_ids=("turtle1",),
+            known_task_ids=set(),
+        )
+
+        self.assertEqual(result.actions, tuple())
+        self.assertIn("tool-level instruction", result.errors[0])
 
 
 if __name__ == "__main__":

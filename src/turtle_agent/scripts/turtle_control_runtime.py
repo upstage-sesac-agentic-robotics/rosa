@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 import rospy
@@ -30,6 +31,7 @@ from rich.panel import Panel
 from ros_params import get_bool_param
 from turtle_control_agent import TurtleControlAgent, TurtleTask, TurtleTaskResult
 from turtle_control_prompts import WORKER_SYSTEM_PROMPT
+from turtle_control_state import WorldState
 
 try:
     from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -64,6 +66,17 @@ class LangChainPlanner:
         return _message_to_text(response)
 
 
+class LangChainDecisionPlanner:
+    """Planner that returns JSON actions for the autonomous control loop."""
+
+    def __init__(self, *, streaming: bool = False) -> None:
+        self.llm = get_llm(streaming=streaming)
+
+    def invoke(self, decision_prompt: str) -> str:
+        response = self.llm.invoke(decision_prompt)
+        return _message_to_text(response)
+
+
 class TurtleSimWorker:
     """LLM worker that operates one assigned turtle through turtlesim tools."""
 
@@ -78,16 +91,30 @@ class TurtleSimWorker:
         )
 
     def __call__(self, task: TurtleTask) -> str:
-        result = self.executor.invoke(
-            {
-                "worker_system_prompt": task.metadata.get(
-                    "worker_system_prompt",
-                    WORKER_SYSTEM_PROMPT,
-                ),
-                "turtle_name": self.turtle_name,
-                "input": task.instruction,
-            }
-        )
+        timeout = _metadata_float(task.metadata.get("timeout_seconds"))
+        old_timeout = getattr(self.executor, "max_execution_time", None)
+        if timeout is not None:
+            try:
+                self.executor.max_execution_time = timeout
+            except Exception:
+                pass
+        try:
+            result = self.executor.invoke(
+                {
+                    "worker_system_prompt": task.metadata.get(
+                        "worker_system_prompt",
+                        WORKER_SYSTEM_PROMPT,
+                    ),
+                    "turtle_name": self.turtle_name,
+                    "input": task.instruction,
+                }
+            )
+        finally:
+            if timeout is not None:
+                try:
+                    self.executor.max_execution_time = old_timeout
+                except Exception:
+                    pass
         if isinstance(result, dict) and "output" in result:
             return str(result["output"])
         return _message_to_text(result)
@@ -97,19 +124,39 @@ def run_turtle_control_agent(
     *,
     obstacle_store: Optional[ObstacleStore] = None,
     lifecycle_listener: Optional[Any] = None,
+    pose_hub: Optional[Any] = None,
+    collision_monitor: Optional[Any] = None,
+    log_control_prompt: Optional[bool] = None,
+    control_prompt_log_path: Optional[Path] = None,
 ) -> None:
     """Run the interactive control-agent loop inside the initialized ROS node."""
     _ = obstacle_store
     console = Console()
     streaming = get_bool_param("~streaming", False)
     worker_count = _get_int_param("~control_worker_count", 2)
-    task_count = _get_int_param("~control_task_count", _DEFAULT_PROMPT_LIMIT)
     timeout = _get_float_param("~control_task_timeout", _DEFAULT_TIMEOUT)
     reset_turtlesim = get_bool_param("~control_reset_turtlesim", False)
+    prompt_log_enabled = (
+        get_bool_param("~control_prompt_log_enabled", False)
+        if log_control_prompt is None
+        else bool(log_control_prompt)
+    )
 
     turtle_names = _turtle_names(worker_count)
-    planner = LangChainPlanner(task_count=task_count, streaming=streaming)
-    control_agent = TurtleControlAgent({}, log_enabled=False)
+    planner = LangChainDecisionPlanner(streaming=streaming)
+    world_state = WorldState()
+    if pose_hub is not None:
+        pose_hub.register_consumer(world_state.on_pose)
+    control_agent = TurtleControlAgent(
+        {},
+        log_enabled=False,
+        world_state=world_state,
+        event_sync=lambda state: _sync_state_events(
+            state,
+            pose_hub=pose_hub,
+            collision_monitor=collision_monitor,
+        ),
+    )
     control_lifecycle = TurtleControlLifecycleListener(
         control_agent,
         worker_factory=lambda turtle_name: TurtleSimWorker(
@@ -136,23 +183,30 @@ def run_turtle_control_agent(
         )
     )
 
-    while not rospy.is_shutdown():
-        try:
-            user_prompt = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n[Shutdown complete]")
-            break
-        if not user_prompt:
-            continue
-        if user_prompt == "exit":
-            break
+    try:
+        while not rospy.is_shutdown():
+            try:
+                user_prompt = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[Shutdown complete]")
+                break
+            if not user_prompt:
+                continue
+            if user_prompt == "exit":
+                break
 
-        results = control_agent.run_user_prompt(
-            user_prompt,
-            planner,
-            timeout=None if timeout <= 0 else timeout,
-        )
-        _print_results(console, results)
+            results = control_agent.run_autonomous_goal(
+                user_prompt,
+                planner,
+                timeout=None if timeout <= 0 else timeout,
+                control_prompt_log_path=(
+                    control_prompt_log_path if prompt_log_enabled else None
+                ),
+            )
+            _print_results(console, results)
+    finally:
+        if pose_hub is not None:
+            pose_hub.unregister_consumer(world_state.on_pose)
 
 
 class TurtleControlLifecycleListener:
@@ -219,10 +273,10 @@ def _build_worker_executor(llm: Any, tools: Sequence[Any], streaming: bool) -> A
             (
                 "human",
                 "assigned_turtle: {turtle_name}\n"
-                "task: {input}\n\n"
+                "WorkerTask JSON:\n{input}\n\n"
                 "Use assigned_turtle as the `name` argument for movement and drawing "
                 "tools. Spawn and kill tools may use the turtle name requested by "
-                "the task.",
+                "the task. Return exactly one WorkerResult JSON object.",
             ),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ]
@@ -314,6 +368,23 @@ def _turtle_names(worker_count: int) -> tuple[str, ...]:
     return tuple(f"turtle{index}" for index in range(1, max(worker_count, 1) + 1))
 
 
+def _sync_state_events(
+    state: WorldState,
+    *,
+    pose_hub: Optional[Any],
+    collision_monitor: Optional[Any],
+) -> None:
+    if pose_hub is not None:
+        snapshot = getattr(pose_hub, "snapshot", None)
+        if callable(snapshot):
+            for turtle_name, (pose, stamp) in snapshot().items():
+                state.on_pose(turtle_name, pose, stamp)
+    if collision_monitor is not None:
+        events = getattr(collision_monitor, "events", None)
+        if events is not None:
+            state.replace_collision_events(tuple(events))
+
+
 def _normalize_turtle_name(name: str) -> str:
     return str(name).strip().replace("/", "")
 
@@ -330,6 +401,16 @@ def _get_float_param(name: str, default: float) -> float:
         return float(rospy.get_param(name, default))
     except (TypeError, ValueError):
         return default
+
+
+def _metadata_float(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
 
 
 def _print_results(console: Console, results: Sequence[TurtleTaskResult]) -> None:

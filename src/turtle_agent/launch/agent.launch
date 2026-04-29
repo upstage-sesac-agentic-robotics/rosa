@@ -9,6 +9,7 @@
     <arg name="control_task_count" default="0" />
     <arg name="control_task_timeout" default="0" />
     <arg name="control_turtle_names" default="" />
+    <arg name="control_prompt_log_enabled" default="false" />
 
     <node name="rosa_turtle_agent"
           pkg="turtle_agent"
@@ -27,5 +28,6 @@
         <param name="control_task_count" value="$(arg control_task_count)" />
         <param name="control_task_timeout" value="$(arg control_task_timeout)" />
         <param name="control_turtle_names" value="$(arg control_turtle_names)" />
+        <param name="control_prompt_log_enabled" value="$(arg control_prompt_log_enabled)" />
     </node>
 </launch>

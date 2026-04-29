@@ -27,10 +27,22 @@ from concurrent.futures import (
     wait,
 )
 from dataclasses import dataclass, field
+from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from turtle_control_decision import AutonomousDecisionLoop, DecisionAction
+from turtle_control_prompt_log import ControlAgentPromptLog
 from turtle_control_prompts import CONTROL_AGENT_PROMPT, WORKER_SYSTEM_PROMPT
+from turtle_control_scheduler import (
+    PriorityTaskQueue,
+    STATUS_BLOCKED,
+    STATUS_DONE,
+    STATUS_FAILED,
+    ScheduledTurtleTask,
+)
+from turtle_control_state import WorldState
+from turtle_control_verifier import CompletionVerifier
 
 _ANSI_RESET = "\033[0m"
 _AGENT_COLORS = (
@@ -68,9 +80,23 @@ class TurtleTaskResult:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
+def _task_timeout_seconds(task: ScheduledTurtleTask) -> Optional[float]:
+    raw = task.metadata.get("timeout_seconds")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0.0:
+        return None
+    return value
+
+
 TurtleWorker = Callable[[TurtleTask], str]
 LogSink = Callable[[str], None]
 PromptPlanner = Callable[[str], Sequence[str]]
+EventSync = Callable[[WorldState], None]
 
 
 class TurtleControlAgent:
@@ -91,6 +117,8 @@ class TurtleControlAgent:
         log_sink: Optional[LogSink] = None,
         control_prompt: str = DEFAULT_CONTROL_AGENT_PROMPT,
         worker_system_prompt: str = DEFAULT_WORKER_SYSTEM_PROMPT,
+        world_state: Optional[WorldState] = None,
+        event_sync: Optional[EventSync] = None,
     ) -> None:
         self._worker_lock = threading.RLock()
         self._workers = dict(workers)
@@ -105,6 +133,8 @@ class TurtleControlAgent:
         }
         self._control_prompt = control_prompt
         self._worker_system_prompt = worker_system_prompt
+        self._world_state = world_state or WorldState()
+        self._event_sync = event_sync
 
     def add_worker(self, turtle_id: str, worker: TurtleWorker) -> None:
         """Register or replace the worker for ``turtle_id``."""
@@ -312,8 +342,399 @@ class TurtleControlAgent:
         self._log_llm_result(user_prompt, prompts)
         return self.run_prompt_queue(prompts, timeout=timeout)
 
+    def run_autonomous_goal(
+        self,
+        user_prompt: str,
+        decision_planner: Any,
+        *,
+        timeout: Optional[float] = None,
+        max_wait_iterations: int = 3,
+        verifier: Optional[CompletionVerifier] = None,
+        world_state: Optional[WorldState] = None,
+        control_prompt_log_path: Optional[Path] = None,
+    ) -> Tuple[TurtleTaskResult, ...]:
+        """
+        Run an event-driven control loop that creates worker prompts on demand.
+
+        The control loop is the single writer for WorldState and TaskQueue. Worker
+        threads only return TurtleTaskResult values, which are verified before
+        dependencies are released.
+        """
+        workers = self._snapshot_workers()
+        process_log = (
+            ControlAgentPromptLog(Path(control_prompt_log_path))
+            if control_prompt_log_path is not None
+            else None
+        )
+        if not workers:
+            if process_log is not None:
+                process_log.begin(user_prompt, tuple())
+                process_log.row(
+                    "사용 가능한 worker가 없어 자율 제어 루프를 blocked로 종료",
+                    worker="control",
+                    status="blocked",
+                )
+                process_log.flush()
+            return (
+                TurtleTaskResult(
+                    turtle_id="control",
+                    ok=False,
+                    instruction=user_prompt,
+                    error="blocked: no workers registered",
+                ),
+            )
+        state = world_state or self._world_state
+        state.reset_goal(user_prompt, tuple(workers))
+        if process_log is not None:
+            process_log.begin(user_prompt, tuple(workers))
+        scheduler = PriorityTaskQueue()
+        decision_loop = AutonomousDecisionLoop(decision_planner)
+        verifier = verifier or CompletionVerifier()
+        results: List[TurtleTaskResult] = []
+        future_context: Dict[Future, Tuple[str, ScheduledTurtleTask, TurtleTask, float]] = {}
+        disabled_workers: set[str] = set()
+        wait_iterations = 0
+        finished = False
+        blocked_reason = ""
+        deadline = None if timeout is None else monotonic() + timeout
+
+        def _sync_events() -> None:
+            if self._event_sync is not None:
+                self._event_sync(state)
+
+        def _known_tasks() -> Tuple[ScheduledTurtleTask, ...]:
+            return scheduler.snapshot()
+
+        def _apply_decision_actions() -> None:
+            nonlocal finished, blocked_reason, wait_iterations
+            _sync_events()
+            try:
+                decision = decision_loop.decide(
+                    state,
+                    tasks=_known_tasks(),
+                    worker_ids=tuple(workers),
+                )
+            except Exception as exc:
+                blocked_reason = f"decision planner failed: {type(exc).__name__}: {exc}"
+                if process_log is not None:
+                    process_log.row(
+                        blocked_reason,
+                        worker="control",
+                        status="blocked",
+                    )
+                wait_iterations = max_wait_iterations
+                return
+            if not decision.actions and not decision.errors:
+                if process_log is not None:
+                    process_log.row(
+                        "DecisionLoop가 action을 반환하지 않아 대기",
+                        worker="control",
+                        status="wait",
+                    )
+                wait_iterations += 1
+                return
+            if decision.errors:
+                blocked_reason = "; ".join(decision.errors)
+                if process_log is not None:
+                    process_log.row(
+                        f"ActionValidator 오류: {blocked_reason}",
+                        worker="control",
+                        status="validator_error",
+                    )
+                wait_iterations += 1
+            for action in decision.actions:
+                try:
+                    if action.type == "enqueue":
+                        task = self._scheduled_task_from_action(action)
+                        scheduler.add(task)
+                        state.upsert_task(task)
+                        if process_log is not None:
+                            process_log.row(
+                                "DecisionLoop: worker 목표형 subprompt 생성 및 큐 등록",
+                                worker_prompt=action.instruction,
+                                worker=action.assigned_worker or "available_worker",
+                                status="queued",
+                            )
+                        wait_iterations = 0
+                    elif action.type == "cancel_queued":
+                        updated = scheduler.cancel(action.task_id, reason=action.reason)
+                        state.upsert_task(updated)
+                        if process_log is not None:
+                            process_log.row(
+                                f"DecisionLoop: queued task 취소({action.task_id})",
+                                worker="control",
+                                status="cancelled",
+                            )
+                    elif action.type == "reprioritize":
+                        updated = scheduler.reprioritize(action.task_id, action.priority)
+                        state.upsert_task(updated)
+                        if process_log is not None:
+                            process_log.row(
+                                f"DecisionLoop: task 우선순위 변경({action.task_id} -> {action.priority})",
+                                worker="control",
+                                status="reprioritized",
+                            )
+                    elif action.type == "wait":
+                        if process_log is not None:
+                            process_log.row(
+                                action.reason or "DecisionLoop: 현재 상태 유지",
+                                worker="control",
+                                status="wait",
+                            )
+                        wait_iterations += 1
+                    elif action.type == "noop":
+                        if process_log is not None:
+                            process_log.row(
+                                action.reason or "DecisionLoop: noop",
+                                worker="control",
+                                status="wait",
+                            )
+                        wait_iterations += 1
+                    elif action.type == "finish":
+                        if process_log is not None:
+                            process_log.row(
+                                action.reason or "DecisionLoop: 사용자 목표 완료 판단",
+                                worker="control",
+                                status="finish",
+                            )
+                        finished = True
+                    elif action.type == "blocked":
+                        blocked_reason = action.reason or "decision loop reported blocked"
+                        if process_log is not None:
+                            process_log.row(
+                                blocked_reason,
+                                worker="control",
+                                status="blocked",
+                            )
+                        wait_iterations = max_wait_iterations
+                except Exception as exc:
+                    blocked_reason = f"failed to apply action {action.type}: {exc}"
+                    if process_log is not None:
+                        process_log.row(
+                            blocked_reason,
+                            worker="control",
+                            status="blocked",
+                        )
+                    wait_iterations = max_wait_iterations
+
+        def _dispatch_ready(executor: ThreadPoolExecutor) -> int:
+            busy_workers = {worker_id for worker_id, _task, _ttask, _started in future_context.values()}
+            completed = scheduler.done_task_ids()
+            dispatched = 0
+            for worker_id in workers:
+                if worker_id in busy_workers or worker_id in disabled_workers:
+                    continue
+                scheduled = scheduler.pop_next_for_worker(
+                    worker_id, completed_task_ids=completed
+                )
+                if scheduled is None:
+                    continue
+                running = scheduler.mark_running(scheduled.task_id)
+                state.upsert_task(running)
+                task = TurtleTask(
+                    turtle_id=worker_id,
+                    instruction=running.instruction,
+                    metadata={
+                        "task_id": running.task_id,
+                        "worker_system_prompt": self._worker_system_prompt,
+                        **dict(running.metadata),
+                    },
+                )
+                started_at = monotonic()
+                self._log_start(task)
+                if process_log is not None:
+                    process_log.row(
+                        "TaskQueue: 의존성이 충족된 task를 유휴 worker에게 배정",
+                        worker_prompt=running.instruction,
+                        worker=worker_id,
+                        status="running",
+                    )
+                future = executor.submit(workers[worker_id], task)
+                future_context[future] = (worker_id, running, task, started_at)
+                dispatched += 1
+            return dispatched
+
+        def _handle_done_future(future: Future) -> None:
+            worker_id, scheduled, task, started_at = future_context.pop(future)
+            _ = worker_id
+            result = self._result_from_future(future, task, started_at)
+            results.append(result)
+            state.update_result(result)
+            if process_log is not None:
+                process_log.row(
+                    f"worker result 수신: {'done' if result.ok else 'failed'}",
+                    worker_prompt="없음",
+                    worker=task.turtle_id,
+                    status="done" if result.ok else "failed",
+                    duration=result.elapsed_seconds,
+                )
+            verified = verifier.verify(scheduled, result, state)
+            if process_log is not None:
+                process_log.row(
+                    f"CompletionVerifier: {verified.status} ({verified.reason})",
+                    worker_prompt="없음",
+                    worker="control",
+                    status=verified.status,
+                )
+            if verified.status == STATUS_DONE:
+                updated = scheduler.mark_done(scheduled.task_id)
+            elif verified.status == STATUS_BLOCKED:
+                updated = scheduler.mark_blocked(
+                    scheduled.task_id, reason=verified.reason
+                )
+                disabled_workers.add(worker_id)
+            else:
+                updated = scheduler.mark_failed(
+                    scheduled.task_id, reason=verified.reason
+                )
+                disabled_workers.add(worker_id)
+            state.upsert_task(updated)
+            self._log_result(result)
+
+        def _mark_task_timeout(future: Future, *, reason: str) -> None:
+            worker_id, scheduled, task, started_at = future_context.pop(future)
+            future.cancel()
+            result = TurtleTaskResult(
+                turtle_id=task.turtle_id,
+                ok=False,
+                instruction=task.instruction,
+                error=reason,
+                elapsed_seconds=monotonic() - started_at,
+                metadata=task.metadata,
+            )
+            results.append(result)
+            state.update_result(result)
+            updated = scheduler.mark_failed(scheduled.task_id, reason=reason)
+            state.upsert_task(updated)
+            disabled_workers.add(worker_id)
+            if process_log is not None:
+                process_log.row(
+                    f"worker timeout: {reason}",
+                    worker_prompt="없음",
+                    worker=task.turtle_id,
+                    status="timeout",
+                    duration=result.elapsed_seconds,
+                )
+            self._log_result(result)
+
+        def _mark_expired_tasks() -> int:
+            expired = []
+            now = monotonic()
+            for future, (_worker_id, scheduled, _task, started_at) in tuple(
+                future_context.items()
+            ):
+                timeout_seconds = _task_timeout_seconds(scheduled)
+                if timeout_seconds is not None and now - started_at >= timeout_seconds:
+                    expired.append((future, timeout_seconds))
+            for future, timeout_seconds in expired:
+                _mark_task_timeout(
+                    future,
+                    reason=f"task timed out after {timeout_seconds:.1f}s",
+                )
+            return len(expired)
+
+        def _next_wait_timeout() -> Optional[float]:
+            waits = []
+            now = monotonic()
+            if deadline is not None:
+                waits.append(max(0.0, deadline - now))
+            for _future, (_worker_id, scheduled, _task, started_at) in future_context.items():
+                timeout_seconds = _task_timeout_seconds(scheduled)
+                if timeout_seconds is not None:
+                    waits.append(max(0.0, started_at + timeout_seconds - now))
+            if not waits:
+                return None
+            return min(waits)
+
+        _apply_decision_actions()
+        executor = ThreadPoolExecutor(
+            max_workers=self._pool_size(len(workers), worker_count=len(workers))
+        )
+        try:
+            while True:
+                _mark_expired_tasks()
+                dispatched = _dispatch_ready(executor)
+                if finished and not future_context and scheduler.ready_count() == 0:
+                    break
+                if wait_iterations >= max_wait_iterations and not future_context:
+                    if not blocked_reason:
+                        blocked_reason = "decision loop made no progress"
+                    break
+                if not future_context:
+                    if scheduler.ready_count() == 0:
+                        _apply_decision_actions()
+                        continue
+                    if dispatched == 0:
+                        _apply_decision_actions()
+                    continue
+
+                wait_timeout = _next_wait_timeout()
+                if wait_timeout == 0.0:
+                    if _mark_expired_tasks():
+                        continue
+                    for future in tuple(future_context):
+                        _mark_task_timeout(future, reason="control goal timed out")
+                    break
+
+                done, _pending = wait(
+                    tuple(future_context),
+                    timeout=wait_timeout,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    if _mark_expired_tasks():
+                        _apply_decision_actions()
+                        continue
+                    for future in tuple(future_context):
+                        _mark_task_timeout(future, reason="control goal timed out")
+                    break
+                for future in done:
+                    _handle_done_future(future)
+                _apply_decision_actions()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        if blocked_reason and not finished:
+            if process_log is not None:
+                process_log.row(
+                    f"blocked 종료: {blocked_reason}",
+                    worker="control",
+                    status="blocked",
+                )
+            results.append(
+                TurtleTaskResult(
+                    turtle_id="control",
+                    ok=False,
+                    instruction=user_prompt,
+                    error=f"blocked: {blocked_reason}",
+                )
+            )
+        if process_log is not None:
+            process_log.flush()
+        return tuple(results)
+
     def _build_control_prompt(self, user_prompt: str) -> str:
         return self._control_prompt.format(user_prompt=user_prompt)
+
+    @staticmethod
+    def _scheduled_task_from_action(action: DecisionAction) -> ScheduledTurtleTask:
+        worker_task = dict(action.worker_task)
+        timeout_seconds = worker_task.get("timeout_seconds")
+        metadata = {
+            "completion_hint": dict(action.completion_hint),
+            "decision_reason": action.reason,
+            "worker_task": worker_task,
+            "timeout_seconds": timeout_seconds,
+        }
+        return ScheduledTurtleTask(
+            task_id=action.task_id,
+            assigned_worker=action.assigned_worker or str(worker_task.get("assigned_turtle", "")),
+            instruction=action.instruction,
+            priority=action.priority,
+            depends_on=action.depends_on,
+            metadata=metadata,
+            reason=action.reason,
+        )
 
     def _snapshot_workers(self) -> Dict[str, TurtleWorker]:
         with self._worker_lock:
@@ -327,6 +748,10 @@ class TurtleControlAgent:
         if worker_count is None:
             worker_count = len(self._snapshot_workers())
         return min(worker_count, runnable_count)
+
+    @staticmethod
+    def _task_timeout_seconds(task: ScheduledTurtleTask) -> Optional[float]:
+        return _task_timeout_seconds(task)
 
     def _agent_label(self, turtle_id: str) -> str:
         with self._worker_lock:

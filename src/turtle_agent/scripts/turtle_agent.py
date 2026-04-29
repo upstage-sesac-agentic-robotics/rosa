@@ -594,6 +594,13 @@ if __name__ == "__main__":
             run_turtle_control_agent(
                 obstacle_store=obstacle_store,
                 lifecycle_listener=pose_hub,
+                pose_hub=pose_hub,
+                collision_monitor=collision_monitor,
+                log_control_prompt=get_bool_param("~control_prompt_log_enabled", False),
+                control_prompt_log_path=(
+                    pose_log_consumer.collision_log_path().parent
+                    / "ControlAgentPrompt.md"
+                ),
             )
         else:
             main(obstacle_store=obstacle_store, load_static_world_once=False)
